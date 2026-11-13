@@ -6,7 +6,8 @@ Python, standard library only) builds everything heavy on the user's machine:
   1. copies the bundled Python to <data>/runtime/python (so app updates and the
      install folder can change without breaking the environment),
   2. detects an NVIDIA GPU and installs the CUDA build of PyTorch, or the CPU
-     build when there's no GPU (or the driver is too old),
+     build when there's no GPU (or the driver is too old). On macOS it installs
+     the standard build from PyPI, which uses the Apple Silicon GPU through MPS,
   3. installs the backend's packages (requirements.txt, pinned by constraints.txt),
   4. installs Chromium for the crawler (Playwright),
   5. downloads the models (EmbeddingGemma 2 and the local LLM) into <data>/models,
@@ -43,6 +44,9 @@ EMBED_MODEL = os.environ.get("VWS_EMBED_MODEL", "google/embeddinggemma-2")
 LLM_MODEL = os.environ.get("VWS_LLM_MODEL", "google/gemma-4-E2B-it")
 TORCH_INDEX = "https://download.pytorch.org/whl/{variant}"
 IS_WIN = os.name == "nt"
+IS_MAC = sys.platform == "darwin"
+# PyTorch build on macOS: the PyPI wheel. On Apple Silicon it includes MPS (GPU).
+MAC_VARIANT = "mps" if (IS_MAC and os.uname().machine == "arm64") else "cpu"
 
 JSON = False
 LOG_FH = None
@@ -116,6 +120,8 @@ def run(cmd: list[str], env: dict | None = None, cwd: str | None = None) -> None
 def default_data_dir() -> Path:
     if IS_WIN:
         return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "VWS"
+    if IS_MAC:
+        return Path.home() / "Library" / "Application Support" / "VWS"
     return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "VWS"
 
 
@@ -158,7 +164,13 @@ def model_cached(models_dir: Path, repo_id: str) -> bool:
 # GPU
 # ---------------------------------------------------------------------------
 def detect_gpu() -> dict:
-    """{'variant': 'cu130'|'cu126'|'cpu', 'gpu': name or None, 'cuda': 'x.y' or None, 'note': str}"""
+    """{'variant': 'cu130'|'cu126'|'cpu'|'mps', 'gpu': name or None, 'cuda': 'x.y' or None, 'note': str}"""
+    if IS_MAC:
+        if MAC_VARIANT == "mps":
+            return {"variant": "mps", "gpu": "Apple Silicon", "cuda": None, "note": ""}
+        return {"variant": "cpu", "gpu": None, "cuda": None,
+                "note": "Intel Mac: no GPU acceleration, using the CPU build. Current PyTorch releases may not "
+                        "support Intel Macs at all; an Apple Silicon Mac is recommended."}
     smi = shutil.which("nvidia-smi")
     if not smi and IS_WIN:
         cand = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "nvidia-smi.exe"
@@ -201,7 +213,8 @@ def step_python(rt: Path) -> Path:
     else:
         if target.exists():
             shutil.rmtree(target)  # a different Python version: its packages must be reinstalled anyway
-        shutil.copytree(src, target)
+        # symlinks=True: keep bin/python3 -> python3.13 and the .dylib links as links (macOS/Linux).
+        shutil.copytree(src, target, symlinks=not IS_WIN)
         marker.write_text(ver)
         emit("step", id="python", label="Python runtime", status="done", detail=f"Python {ver}")
     return runtime_python(rt)
@@ -239,7 +252,7 @@ def pip_env(models_dir: Path) -> dict:
 
 
 def installed_torch(py: Path, env: dict) -> str | None:
-    """'cu130' / 'cu126' / 'cpu' for the torch already installed, None if there's none."""
+    """'cu130' / 'cu126' / 'cpu' / 'mps' for the torch already installed, None if there's none."""
     try:
         out = subprocess.run([str(py), "-c", "import torch,sys; sys.stdout.write(torch.version.cuda or 'cpu')"],
                              capture_output=True, text=True, timeout=180, env=env)
@@ -248,21 +261,29 @@ def installed_torch(py: Path, env: dict) -> str | None:
     if out.returncode != 0:
         return None
     v = out.stdout.strip()
+    if IS_MAC:
+        return MAC_VARIANT
     return "cpu" if v == "cpu" else "cu" + v.replace(".", "")[:3]
 
 
 def step_torch(py: Path, env: dict, gpu: dict, force: bool) -> str:
     variant = gpu["variant"]
-    label = f"PyTorch ({'CUDA ' + gpu['cuda'] + ' for ' + gpu['gpu'] if variant != 'cpu' else 'CPU'})"
+    if variant == "mps":
+        label = "PyTorch (Apple Silicon GPU)"
+    else:
+        label = f"PyTorch ({'CUDA ' + gpu['cuda'] + ' for ' + gpu['gpu'] if variant != 'cpu' else 'CPU'})"
     emit("step", id="torch", label=label, status="running", detail=gpu.get("note") or "")
     have = installed_torch(py, env)
     if have == variant and not force:
         emit("step", id="torch", label=label, status="skipped", detail="already installed")
         return variant
-    index = os.environ.get("VWS_TORCH_INDEX") or TORCH_INDEX.format(variant=variant)
+    # macOS wheels come from PyPI (one build, with MPS on Apple Silicon); Windows/Linux pick a
+    # CUDA or CPU build from pytorch.org.
+    index = os.environ.get("VWS_TORCH_INDEX") or (None if IS_MAC else TORCH_INDEX.format(variant=variant))
     if have:
         run([str(py), "-m", "pip", "uninstall", "-y", "torch", "torchvision"], env=env)
-    run([str(py), "-m", "pip", "install", "--upgrade", "torch", "torchvision", "--index-url", index,
+    run([str(py), "-m", "pip", "install", "--upgrade", "torch", "torchvision",
+         *(["--index-url", index] if index else []),
          "--progress-bar", "off" if JSON else "on"], env=env)
     emit("step", id="torch", label=label, status="done")
     return variant
@@ -346,13 +367,16 @@ def step_verify(py: Path, env: dict, variant: str) -> dict:
     emit("step", id="verify", label="Checking the install", status="running")
     code = ("import json, sys, torch, sentence_transformers, transformers, sqlite_vec, trafilatura, playwright, fastapi; "
             "ok = torch.cuda.is_available(); "
-            "sys.stdout.write(json.dumps({'torch': torch.__version__, 'cuda': ok, "
-            "'device': torch.cuda.get_device_name(0) if ok else 'cpu'}))")
+            "mps = bool(getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available()); "
+            "sys.stdout.write(json.dumps({'torch': torch.__version__, 'cuda': ok, 'mps': mps, "
+            "'device': torch.cuda.get_device_name(0) if ok else ('Apple Silicon GPU (MPS)' if mps else 'cpu')}))")
     out = subprocess.run([str(py), "-c", code], capture_output=True, text=True, env=env, timeout=600)
     if out.returncode != 0:
         raise RuntimeError("The packages installed but don't import:\n" + out.stderr[-1500:])
     info = json.loads(out.stdout.strip().splitlines()[-1])
-    if variant != "cpu" and not info["cuda"]:
+    if variant == "mps" and not info["mps"]:
+        emit("warn", message="PyTorch can't see the Apple Silicon GPU (MPS); VWS will run on the CPU.")
+    elif variant not in ("cpu", "mps") and not info["cuda"]:
         emit("warn", message="The CUDA build of PyTorch is installed but the GPU isn't visible to it; VWS will run on the CPU.")
     emit("step", id="verify", label="Checking the install", status="done", detail=f"torch {info['torch']} on {info['device']}")
     return info
@@ -398,7 +422,7 @@ def main() -> int:
     emit("plan", steps=[{"id": i, "label": l} for i, l in steps], data_dir=str(data))
 
     try:
-        need_gb = (3.5 if a.gpu != "cpu" else 1.5) + 1.6 + (0 if a.skip_llm else 10.4) + 0.5
+        need_gb = (1.5 if (IS_MAC or a.gpu == "cpu") else 3.5) + 1.6 + (0 if a.skip_llm else 10.4) + 0.5
         free_gb = shutil.disk_usage(data).free / 1e9
         if free_gb < need_gb:
             raise RuntimeError(f"Not enough disk space in {data}: about {need_gb:.0f} GB is needed, {free_gb:.0f} GB is free.")
@@ -409,7 +433,7 @@ def main() -> int:
         gpu = detect_gpu() if a.gpu == "auto" else (
             {"variant": "cpu", "gpu": None, "cuda": None, "note": "CPU build requested."} if a.gpu == "cpu"
             else {**detect_gpu(), "note": ""})
-        if a.gpu == "cuda" and gpu["variant"] == "cpu":
+        if a.gpu == "cuda" and not gpu["variant"].startswith("cu"):
             raise RuntimeError(gpu.get("note") or "No usable NVIDIA GPU found.")
         if gpu.get("note"):
             emit("warn" if gpu.get("gpu") else "info", message=gpu["note"])
@@ -422,7 +446,7 @@ def main() -> int:
         info = step_verify(py, env, variant)
         save_state(rt, {"complete": True, "setup_version": SETUP_VERSION, "variant": variant, "hash": requirements_hash(variant),
                         "gpu": gpu.get("gpu"), "cuda_driver": gpu.get("cuda"), "torch": info["torch"],
-                        "cuda_available": info["cuda"], "device": info["device"], "skip_llm": a.skip_llm,
+                        "cuda_available": info["cuda"], "mps_available": info.get("mps", False), "device": info["device"], "skip_llm": a.skip_llm,
                         "embed_model": EMBED_MODEL, "llm_model": None if a.skip_llm else LLM_MODEL,
                         "python": str(py), "finished_at": time.strftime("%Y-%m-%d %H:%M:%S")})
         emit("done", ok=True, summary=f"torch {info['torch']} on {info['device']}")

@@ -4,6 +4,67 @@ VWS is a local-first desktop app for relevance engineering. It crawls a site (Pl
 
 ---
 
+## 🍎 macOS (this fork)
+
+This is a fork of [iPullRank-dev/vws](https://github.com/iPullRank-dev/vws) (Apache 2.0) with macOS support added. The analysis engine and the UI are unchanged; the Windows installer still builds as before.
+
+**What changed for the Mac**
+
+* `vws-ui/package.json`: a macOS build target (`npm run dist:mac` makes an Apple Silicon `.dmg`) and a `setup:dev` script.
+* `vws-ui/electron/main.ts`: data lives in `~/Library/Application Support/VWS`; closing the window quits the app (so the Python engine doesn't keep running in the background); the engine and its child processes are stopped as a group on quit (force-stopped after a few seconds if a long generation is still running).
+* `vws-backend/services/llm.py`: on Apple Silicon the local LLM is loaded fully onto the Apple GPU. The default placement offloaded part of it to disk, which made a rewrite take minutes instead of seconds.
+* `vws-backend/setup_runtime.py`: on a Mac it installs the standard PyTorch build from PyPI, which uses the Apple Silicon GPU through MPS, and skips the NVIDIA and Visual C++ steps.
+* `vws-ui/scripts/fetch-python.mjs`: downloads the macOS build of the bundled Python (`--platform=mac`).
+* `vws-ui/scripts/after-pack.cjs`: ad-hoc signs the Mac app so Apple Silicon will run it.
+* `vws-ui/scripts/setup-dev.mjs`: sets up the backend for running from source without a system Python.
+
+**Requirements:** an Apple Silicon Mac (M1 or later), [Node.js](https://nodejs.org/en/) 18+, Git, and about 13 GB of disk for the full setup (3 GB without the local LLM). Intel Macs aren't supported: current PyTorch has no Intel Mac builds.
+
+### Run from source on a Mac
+
+macOS ships Python 3.9, which is too old for the backend. `setup:dev` downloads a self-contained Python 3.13 into `vws-ui/build-resources` and builds `vws-backend/venv` from it, so you don't need Homebrew or a python.org install.
+
+```bash
+cd vws-ui
+npm install
+npm run setup:dev     # once: Python, backend packages, Chromium for the crawler
+npm run dev           # opens the VWS window and starts the backend on port 8060
+```
+
+If `npm install` reports that install scripts were blocked (npm 12+), run `npm rebuild electron esbuild` once; both are pre-approved in `package.json`.
+
+The first start downloads EmbeddingGemma 2 (about 1.5 GB). The local LLM (about 10 GB) downloads the first time you use rewrite suggestions or an AI brief. The sidebar shows `mps` once the embedding model is on the GPU.
+
+### Build the Mac app (.dmg)
+
+```bash
+cd vws-ui
+npm install
+npm run dist:mac      # → release/VWS-<version>-arm64.dmg
+```
+
+`npm run dist:mac:dir` builds only the unpacked app (`release/mac-arm64/VWS.app`), which is quicker for testing. Both package the copy of Electron that `npm install` already put in `node_modules`, so the build doesn't download it a second time.
+
+**Install it:** open the `.dmg` and drag VWS to Applications. The app isn't signed with an Apple Developer ID, so the first time you open it macOS blocks it. Go to **System Settings → Privacy & Security**, scroll to the message about VWS and click **Open Anyway**. If macOS says the app "is damaged", clear the download flag once:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/VWS.app
+```
+
+**First launch:** there is no installer step on a Mac, so the app sets itself up the first time it opens, with a progress screen: Python runtime, PyTorch, packages, Chromium, then the models. Leave it running; it resumes where it stopped if you quit.
+
+| | Where |
+|---|---|
+| Projects (`vws.sqlite`, `uploads/`) | `~/Library/Application Support/VWS` |
+| Models and Python runtime | `~/Library/Application Support/VWS/models`, `.../runtime` |
+| Logs (`setup.log`, `backend.log`) | `~/Library/Application Support/VWS/logs` |
+
+* **Re-run setup:** `/Applications/VWS.app/Contents/MacOS/VWS --setup` (`--setup-force` reinstalls everything).
+* **Uninstall:** drag VWS to the Trash. To free the disk space, also delete `~/Library/Application Support/VWS/runtime` and `.../models`. Your projects stay in that folder unless you delete it too.
+* **Bring over projects from the dev setup:** quit VWS, then copy `vws-backend/vws.sqlite` (and `vws-backend/uploads`) into `~/Library/Application Support/VWS`.
+
+---
+
 ## What's new (EmbeddingGemma 2 + Action layer)
 
 * **EmbeddingGemma 2** (`google/embeddinggemma-2`, Apache 2.0, Oct 2026) replaces `embeddinggemma-300m`. Only the 270M text backbone is loaded (vision/audio encoders off).

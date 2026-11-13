@@ -46,15 +46,29 @@ class LocalLLMManager:
             except ImportError:
                 pass
 
+            # On Apple Silicon, device_map="auto" underestimates the unified memory and offloads
+            # part of the model to disk, which makes generation take minutes. Put the whole model
+            # on the Apple GPU first, and fall back to "auto" if that doesn't fit.
+            device_maps: list = ["auto"]
+            try:
+                import torch
+                if torch.backends.mps.is_available():
+                    device_maps = [{"": "mps"}, "auto"]
+            except Exception:
+                pass
+
             last_err: Exception | None = None
             for cls in model_classes:
-                try:
-                    self.model = cls.from_pretrained(self.model_id, device_map="auto")
-                    print(f"Loaded model with {cls.__name__}")
+                for device_map in device_maps:
+                    try:
+                        self.model = cls.from_pretrained(self.model_id, device_map=device_map)
+                        print(f"Loaded model with {cls.__name__} (device_map={device_map})")
+                        break
+                    except Exception as e:
+                        last_err = e
+                        self.model = None
+                if self.model is not None:
                     break
-                except Exception as e:
-                    last_err = e
-                    self.model = None
             if self.model is None:
                 raise last_err if last_err else RuntimeError("No compatible AutoModel class found")
 

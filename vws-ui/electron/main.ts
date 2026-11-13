@@ -9,14 +9,18 @@ import { spawn, execFile, ChildProcess } from 'child_process'
 // port 8060 with --reload, as before.
 // Packaged: the installer ships a small Python (resources/python) and the backend
 // source (resources/backend). setup_runtime.py builds the real environment in
-// %LOCALAPPDATA%\VWS (PyTorch for the GPU or CPU, packages, Chromium, models);
-// the installer runs it, and this file runs it again with a progress screen if
-// anything is missing. Projects (database, uploads) also live there, so updates
+// the data folder (PyTorch for the GPU or CPU, packages, Chromium, models).
+// On Windows the installer runs it, and this file runs it again with a progress
+// screen if anything is missing. On macOS there is no installer step (a .dmg only
+// copies the app), so the first launch always runs it with the progress screen. Projects (database, uploads) also live there, so updates
 // and reinstalls keep them.
 const isDev = !!process.env.VITE_DEV_SERVER_URL
 const DEV_PORT = 8060
 
-const dataDir = path.join(process.env.LOCALAPPDATA || app.getPath('userData'), 'VWS')
+// Windows: %LOCALAPPDATA%\VWS. macOS: ~/Library/Application Support/VWS. Linux: ~/.config/VWS.
+const dataDir = process.platform === 'win32'
+  ? path.join(process.env.LOCALAPPDATA || app.getPath('appData'), 'VWS')
+  : path.join(app.getPath('appData'), 'VWS')
 const runtimeDir = path.join(dataDir, 'runtime')
 const logsDir = path.join(dataDir, 'logs')
 const backendDir = isDev ? path.join(__dirname, '../../vws-backend') : path.join(process.resourcesPath, 'backend')
@@ -64,7 +68,7 @@ const SCREEN = `<!doctype html><html><head><meta charset="utf-8"><title>VWS</tit
   li i{font-style:normal;color:#475569}li.running i{color:#60a5fa}li.done i,li.skipped i{color:#10b981}li.failed i{color:#ef4444}li small{display:block;color:#94a3b8}
   .bar{height:6px;background:#1e293b;border-radius:3px;overflow:hidden;margin:6px 0 2px}.bar b{display:block;height:100%;width:0;background:#60a5fa;transition:width .4s}
   .bar.ind b{width:30%;animation:ind 1.4s infinite ease-in-out}@keyframes ind{0%{margin-left:-30%}100%{margin-left:100%}}
-  pre{background:#020617;border:1px solid #1e293b;border-radius:6px;padding:10px;color:#64748b;font:12px/1.45 Consolas,monospace;white-space:pre-wrap;max-height:150px;overflow:hidden}
+  pre{background:#020617;border:1px solid #1e293b;border-radius:6px;padding:10px;color:#64748b;font:12px/1.45 Consolas,Menlo,monospace;white-space:pre-wrap;max-height:150px;overflow:hidden}
   .err{background:#450a0a;border:1px solid #7f1d1d;color:#fecaca;border-radius:6px;padding:10px 12px;margin:12px 0;white-space:pre-wrap}
   .warn{color:#fcd34d;margin:6px 0}a.btn{display:inline-block;margin-right:8px;padding:7px 14px;border-radius:6px;background:#2563eb;color:#fff;text-decoration:none}a.btn.sec{background:#1e293b}
 </style></head><body><main><h1>VWS</h1><p class="sub" id="sub">Starting…</p><ol id="steps"></ol><div id="msgs"></div><pre id="log" hidden></pre><div id="actions"></div></main>
@@ -162,7 +166,8 @@ function startBackend(port: number) {
   log.write(`\n=== ${new Date().toISOString()} start on port ${port} ===\n`)
   if (isDev) {
     const venvPython = path.join(backendDir, 'venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python')
-    backend = spawn(venvPython, ['-m', 'uvicorn', 'main:app', '--host', '127.0.0.1', '--port', String(port), '--reload'], { cwd: backendDir })
+    backend = spawn(venvPython, ['-m', 'uvicorn', 'main:app', '--host', '127.0.0.1', '--port', String(port), '--reload'],
+      { cwd: backendDir, detached: process.platform !== 'win32' })
   } else {
     const env = {
       ...process.env,
@@ -178,7 +183,7 @@ function startBackend(port: number) {
       PYTHONNOUSERSITE: '1',
     }
     backend = spawn(runtimePython, ['-m', 'uvicorn', 'main:app', '--host', '127.0.0.1', '--port', String(port)],
-      { cwd: backendDir, env, windowsHide: true })
+      { cwd: backendDir, env, windowsHide: true, detached: process.platform !== 'win32' })
   }
   backend.stdout?.on('data', d => { log.write(d); if (isDev) process.stdout.write(`Backend: ${d}`) })
   backend.stderr?.on('data', d => { log.write(d); if (isDev) process.stderr.write(`Backend: ${d}`) })
@@ -196,7 +201,16 @@ function stopBackend() {
     // kill() on Windows only ends python.exe, not uvicorn's children (crawls, workers).
     execFile('taskkill', ['/pid', String(backend.pid), '/T', '/F'], () => {})
   } else {
-    backend.kill()
+    // The backend is started as its own process group (detached), so this also ends
+    // uvicorn's reload worker and the crawler's browser processes.
+    try { process.kill(-backend.pid, 'SIGTERM') } catch { backend.kill() }
+    // uvicorn waits for in-flight requests on SIGTERM, and a long LLM generation can hold
+    // it open for minutes after the app has quit. Force the group down after a grace period
+    // (from a detached shell, since this process is about to exit).
+    try {
+      spawn('/bin/sh', ['-c', `sleep 4; kill -9 -- -${backend.pid} 2>/dev/null`],
+        { detached: true, stdio: 'ignore' }).unref()
+    } catch { /* best effort */ }
   }
 }
 
@@ -248,7 +262,9 @@ app.on('activate', () => {
 })
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit()
+  // Quit on every platform, macOS included: leaving the app in the Dock would keep
+  // the Python backend and the embedding model (several GB of RAM) running.
+  app.quit()
 })
 
 app.on('before-quit', () => {

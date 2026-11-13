@@ -13,8 +13,11 @@
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "preview": "vite preview",
     "fetch-python": "node scripts/fetch-python.mjs",
-    "dist": "npm run build && node scripts/fetch-python.mjs && electron-builder --win",
-    "dist:dir": "npm run build && node scripts/fetch-python.mjs && electron-builder --win --dir"
+    "dist": "npm run build && node scripts/fetch-python.mjs --platform=win && electron-builder --win",
+    "dist:dir": "npm run build && node scripts/fetch-python.mjs --platform=win && electron-builder --win --dir",
+    "dist:mac": "npm run build && node scripts/fetch-python.mjs --platform=mac && electron-builder --mac -c.electronDist=node_modules/electron/dist",
+    "dist:mac:dir": "npm run build && node scripts/fetch-python.mjs --platform=mac && electron-builder --mac --dir -c.electronDist=node_modules/electron/dist",
+    "setup:dev": "node scripts/fetch-python.mjs && node scripts/setup-dev.mjs"
   },
   "build": {
     "appId": "com.ipullrank.vws",
@@ -55,6 +58,19 @@
       ],
       "signAndEditExecutable": false
     },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "category": "public.app-category.developer-tools",
+      "identity": null
+    },
+    "afterPack": "scripts/after-pack.cjs",
     "nsis": {
       "oneClick": false,
       "perMachine": false,
@@ -91,5 +107,9 @@
     "typescript": "^5.2.2",
     "vite": "^5.0.8",
     "vite-plugin-electron": "^0.15.5"
+  },
+  "allowScripts": {
+    "electron@28.3.3": true,
+    "esbuild@0.21.5": true
   }
 }

@@ -3,11 +3,13 @@
 // The installer runs vws-backend/setup_runtime.py with it to build the real
 // environment (PyTorch for the GPU or CPU, packages, models) on the user's machine.
 //
-//   node scripts/fetch-python.mjs            # Windows x64 build (what the installer needs)
-//   node scripts/fetch-python.mjs --force    # re-download
+//   node scripts/fetch-python.mjs                  # build for this machine (Windows x64 or macOS arm64/x64)
+//   node scripts/fetch-python.mjs --platform=win   # Windows x64 (what the NSIS installer needs)
+//   node scripts/fetch-python.mjs --platform=mac   # macOS, this machine's architecture (what the .dmg needs)
+//   node scripts/fetch-python.mjs --force          # re-download
 // Env: VWS_PYTHON_URL   exact .tar.gz to use instead of the latest release
 //      VWS_PYTHON_MINOR Python minor version (default 3.13, matching the dev venv)
-//      VWS_PYTHON_TARGET target triple (default x86_64-pc-windows-msvc)
+//      VWS_PYTHON_TARGET target triple (overrides --platform), e.g. aarch64-apple-darwin
 import { execFileSync } from 'node:child_process';
 import { createWriteStream, existsSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -19,7 +21,10 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const outDir = join(root, 'build-resources');
 const pyDir = join(outDir, 'python');
 const minor = process.env.VWS_PYTHON_MINOR || '3.13';
-const target = process.env.VWS_PYTHON_TARGET || 'x86_64-pc-windows-msvc';
+const platformArg = (process.argv.find(x => x.startsWith('--platform=')) || '').split('=')[1]
+  || (process.platform === 'darwin' ? 'mac' : 'win');
+const macTarget = process.arch === 'arm64' ? 'aarch64-apple-darwin' : 'x86_64-apple-darwin';
+const target = process.env.VWS_PYTHON_TARGET || (platformArg === 'mac' ? macTarget : 'x86_64-pc-windows-msvc');
 const force = process.argv.includes('--force');
 const stamp = join(outDir, 'python.source.txt');
 
@@ -36,9 +41,20 @@ async function latestAssetUrl() {
   throw new Error(`No ${minor} ${target} install_only build in the latest python-build-standalone releases.`);
 }
 
-const url = process.env.VWS_PYTHON_URL || await latestAssetUrl();
 const exe = target.includes('windows') ? join(pyDir, 'python.exe') : join(pyDir, 'bin', 'python3');
-if (!force && existsSync(exe) && existsSync(stamp) && readFileSync(stamp, 'utf8').trim() === url) {
+const have = existsSync(exe) && existsSync(stamp) ? readFileSync(stamp, 'utf8').trim() : '';
+let url = process.env.VWS_PYTHON_URL;
+if (!url) {
+  try {
+    url = await latestAssetUrl();
+  } catch (e) {
+    // GitHub unreachable or rate-limited: keep the Python that's already here if it's the right build.
+    if (force || !have.includes(`-${target}-`) || !have.includes(`cpython-${minor}.`)) throw e;
+    console.warn(`Couldn't check for a newer Python (${e.message}); using the one in build-resources/python (${have.split('/').pop()})`);
+    process.exit(0);
+  }
+}
+if (!force && have === url) {
   console.log(`Python already in build-resources/python (${url.split('/').pop()})`);
   process.exit(0);
 }
